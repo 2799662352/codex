@@ -657,8 +657,11 @@ mod tests {
     use codex_app_server_protocol::ConfigWarningNotification;
     use codex_app_server_protocol::DynamicToolCallParams;
     use codex_app_server_protocol::FileChangeRequestApprovalParams;
+    use codex_app_server_protocol::GuardianWarningNotification;
     use codex_app_server_protocol::ModelRerouteReason;
     use codex_app_server_protocol::ModelReroutedNotification;
+    use codex_app_server_protocol::ModelVerification;
+    use codex_app_server_protocol::ModelVerificationNotification;
     use codex_app_server_protocol::RateLimitSnapshot;
     use codex_app_server_protocol::RateLimitWindow;
     use codex_app_server_protocol::ToolRequestUserInputParams;
@@ -735,8 +738,8 @@ mod tests {
                     }),
                     secondary: None,
                     credits: None,
-                    spend_control: None,
                     plan_type: Some(PlanType::Plus),
+                    rate_limit_reached_type: None,
                 },
             });
 
@@ -755,8 +758,8 @@ mod tests {
                         },
                         "secondary": null,
                         "credits": null,
-                        "spendControl": null,
-                        "planType": "plus"
+                        "planType": "plus",
+                        "rateLimitReachedType": null
                     }
                 },
             }),
@@ -771,8 +774,6 @@ mod tests {
         let notification = ServerNotification::AccountUpdated(AccountUpdatedNotification {
             auth_mode: Some(AuthMode::ApiKey),
             plan_type: None,
-            workspace_role: None,
-            is_workspace_owner: None,
         });
 
         let jsonrpc_notification = OutgoingMessage::AppServerNotification(notification);
@@ -781,9 +782,7 @@ mod tests {
                 "method": "account/updated",
                 "params": {
                     "authMode": "apikey",
-                    "planType": null,
-                    "workspaceRole": null,
-                    "isWorkspaceOwner": null
+                    "planType": null
                 },
             }),
             serde_json::to_value(jsonrpc_notification)
@@ -817,6 +816,28 @@ mod tests {
     }
 
     #[test]
+    fn verify_guardian_warning_notification_serialization() {
+        let notification = ServerNotification::GuardianWarning(GuardianWarningNotification {
+            thread_id: "thread-1".to_string(),
+            message: "Automatic approval review denied the requested action.".to_string(),
+        });
+
+        let jsonrpc_notification = OutgoingMessage::AppServerNotification(notification);
+        assert_eq!(
+            json!({
+                "method": "guardianWarning",
+                "params": {
+                    "threadId": "thread-1",
+                    "message": "Automatic approval review denied the requested action.",
+                },
+            }),
+            serde_json::to_value(jsonrpc_notification)
+                .expect("ensure the notification serializes correctly"),
+            "ensure the notification serializes correctly"
+        );
+    }
+
+    #[test]
     fn verify_model_rerouted_notification_serialization() {
         let notification = ServerNotification::ModelRerouted(ModelReroutedNotification {
             thread_id: "thread-1".to_string(),
@@ -836,6 +857,30 @@ mod tests {
                     "fromModel": "gpt-5.3-codex",
                     "toModel": "gpt-5.2",
                     "reason": "highRiskCyberActivity",
+                },
+            }),
+            serde_json::to_value(jsonrpc_notification)
+                .expect("ensure the notification serializes correctly"),
+            "ensure the notification serializes correctly"
+        );
+    }
+
+    #[test]
+    fn verify_model_verification_notification_serialization() {
+        let notification = ServerNotification::ModelVerification(ModelVerificationNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            verifications: vec![ModelVerification::TrustedAccessForCyber],
+        });
+
+        let jsonrpc_notification = OutgoingMessage::AppServerNotification(notification);
+        assert_eq!(
+            json!({
+                "method": "model/verification",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "verifications": ["trustedAccessForCyber"],
                 },
             }),
             serde_json::to_value(jsonrpc_notification)
@@ -1071,6 +1116,7 @@ mod tests {
                     thread_id: thread_id.to_string(),
                     turn_id: "turn-1".to_string(),
                     call_id: "call-0".to_string(),
+                    namespace: None,
                     tool: "tool".to_string(),
                     arguments: json!({}),
                 },
@@ -1128,6 +1174,7 @@ mod tests {
                     thread_id: thread_id.to_string(),
                     turn_id: "turn-1".to_string(),
                     call_id: "call-0".to_string(),
+                    namespace: None,
                     tool: "tool".to_string(),
                     arguments: json!({}),
                 },

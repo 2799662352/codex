@@ -32,14 +32,20 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use async_channel::Sender;
+use codex_api::SharedAuthProvider;
 use codex_async_utils::CancelErr;
 use codex_async_utils::OrCancelExt;
 use codex_config::Constrained;
 use codex_config::types::OAuthCredentialsStoreMode;
+use codex_exec_server::Environment;
+use codex_exec_server::HttpClient;
+use codex_exec_server::ReqwestHttpClient;
+use codex_protocol::ToolName;
 use codex_protocol::approvals::ElicitationRequest;
 use codex_protocol::approvals::ElicitationRequestEvent;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::mcp::RequestId as ProtocolRequestId;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -49,8 +55,11 @@ use codex_protocol::protocol::McpStartupStatus;
 use codex_protocol::protocol::McpStartupUpdateEvent;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_rmcp_client::ElicitationResponse;
+use codex_rmcp_client::ExecutorStdioServerLauncher;
+use codex_rmcp_client::LocalStdioServerLauncher;
 use codex_rmcp_client::RmcpClient;
 use codex_rmcp_client::SendElicitation;
+use codex_rmcp_client::StdioServerLauncher;
 use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use futures::future::Shared;
@@ -115,21 +124,10 @@ fn sha1_hex(s: &str) -> String {
 }
 
 pub fn codex_apps_tools_cache_key(auth: Option<&CodexAuth>) -> CodexAppsToolsCacheKey {
-    let token_data = auth.and_then(|auth| auth.get_token_data().ok());
-    let account_id = token_data
-        .as_ref()
-        .and_then(|token_data| token_data.account_id.clone());
-    let chatgpt_user_id = token_data
-        .as_ref()
-        .and_then(|token_data| token_data.id_token.chatgpt_user_id.clone());
-    let is_workspace_account = token_data
-        .as_ref()
-        .is_some_and(|token_data| token_data.id_token.is_workspace_account());
-
     CodexAppsToolsCacheKey {
-        account_id,
-        chatgpt_user_id,
-        is_workspace_account,
+        account_id: auth.and_then(CodexAuth::get_account_id),
+        chatgpt_user_id: auth.and_then(CodexAuth::get_chatgpt_user_id),
+        is_workspace_account: auth.is_some_and(CodexAuth::is_workspace_account),
     }
 }
 
@@ -153,6 +151,12 @@ pub struct ToolInfo {
     #[serde(default)]
     pub plugin_display_names: Vec<String>,
     pub connector_description: Option<String>,
+}
+
+impl ToolInfo {
+    pub fn canonical_tool_name(&self) -> ToolName {
+        ToolName::namespaced(self.callable_namespace.clone(), self.callable_name.clone())
+    }
 }
 
 const META_OPENAI_FILE_PARAMS: &str = "openai/fileParams";
@@ -432,7 +436,7 @@ struct ManagedClient {
     tool_filter: ToolFilter,
     tool_timeout: Option<Duration>,
     server_instructions: Option<String>,
-    server_supports_sandbox_state_capability: bool,
+    server_supports_sandbox_state_meta_capability: bool,
     codex_apps_tools_cache_context: Option<CodexAppsToolsCacheContext>,
 }
 
@@ -461,22 +465,6 @@ impl ManagedClient {
 
         self.tools.clone()
     }
-
-    /// Returns once the server has ack'd the sandbox state update.
-    async fn notify_sandbox_state_change(&self, sandbox_state: &SandboxState) -> Result<()> {
-        if !self.server_supports_sandbox_state_capability {
-            return Ok(());
-        }
-
-        let _response = self
-            .client
-            .send_custom_request(
-                MCP_SANDBOX_STATE_METHOD,
-                Some(serde_json::to_value(sandbox_state)?),
-            )
-            .await?;
-        Ok(())
-    }
 }
 
 #[derive(Clone)]
@@ -500,6 +488,8 @@ impl AsyncManagedClient {
         elicitation_requests: ElicitationRequestManager,
         codex_apps_tools_cache_context: Option<CodexAppsToolsCacheContext>,
         tool_plugin_provenance: Arc<ToolPluginProvenance>,
+        runtime_environment: McpRuntimeEnvironment,
+        runtime_auth_provider: Option<SharedAuthProvider>,
     ) -> Self {
         let tool_filter = ToolFilter::from_config(&config);
         let startup_snapshot = load_startup_cached_codex_apps_tools_snapshot(
@@ -516,8 +506,16 @@ impl AsyncManagedClient {
                     return Err(error.into());
                 }
 
-                let client =
-                    Arc::new(make_rmcp_client(&server_name, config.transport, store_mode).await?);
+                let client = Arc::new(
+                    make_rmcp_client(
+                        &server_name,
+                        config.clone(),
+                        store_mode,
+                        runtime_environment,
+                        runtime_auth_provider,
+                    )
+                    .await?,
+                );
                 match start_server_task(
                     server_name,
                     client,
@@ -634,22 +632,17 @@ impl AsyncManagedClient {
         };
         tools.map(annotate_tools)
     }
-
-    async fn notify_sandbox_state_change(&self, sandbox_state: &SandboxState) -> Result<()> {
-        let managed = self.client().await?;
-        managed.notify_sandbox_state_change(sandbox_state).await
-    }
 }
 
-pub const MCP_SANDBOX_STATE_CAPABILITY: &str = "codex/sandbox-state";
-
-/// Custom MCP request to push sandbox state updates.
-/// When used, the `params` field of the notification is [`SandboxState`].
-pub const MCP_SANDBOX_STATE_METHOD: &str = "codex/sandbox-state/update";
+/// MCP server capability indicating that Codex should include [`SandboxState`]
+/// in tool-call request `_meta` under this key.
+pub const MCP_SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SandboxState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_profile: Option<PermissionProfile>,
     pub sandbox_policy: SandboxPolicy,
     pub codex_linux_sandbox_exe: Option<PathBuf>,
     pub sandbox_cwd: PathBuf,
@@ -662,6 +655,37 @@ pub struct McpConnectionManager {
     clients: HashMap<String, AsyncManagedClient>,
     server_origins: HashMap<String, String>,
     elicitation_requests: ElicitationRequestManager,
+}
+
+/// Runtime placement information used when starting MCP server transports.
+///
+/// `McpConfig` describes what servers exist. This value describes where those
+/// servers should run for the current caller. Keep it explicit at manager
+/// construction time so status/snapshot paths and real sessions make the same
+/// local-vs-remote decision. `fallback_cwd` is not a per-server override; it is
+/// used when a stdio server omits `cwd` and the launcher needs a concrete
+/// process working directory.
+#[derive(Clone)]
+pub struct McpRuntimeEnvironment {
+    environment: Arc<Environment>,
+    fallback_cwd: PathBuf,
+}
+
+impl McpRuntimeEnvironment {
+    pub fn new(environment: Arc<Environment>, fallback_cwd: PathBuf) -> Self {
+        Self {
+            environment,
+            fallback_cwd,
+        }
+    }
+
+    fn environment(&self) -> Arc<Environment> {
+        Arc::clone(&self.environment)
+    }
+
+    fn fallback_cwd(&self) -> PathBuf {
+        self.fallback_cwd.clone()
+    }
 }
 
 impl McpConnectionManager {
@@ -723,21 +747,24 @@ impl McpConnectionManager {
         approval_policy: &Constrained<AskForApproval>,
         submit_id: String,
         tx_event: Sender<Event>,
-        initial_sandbox_state: SandboxState,
+        initial_sandbox_policy: SandboxPolicy,
+        runtime_environment: McpRuntimeEnvironment,
         codex_home: PathBuf,
         codex_apps_tools_cache_key: CodexAppsToolsCacheKey,
         tool_plugin_provenance: ToolPluginProvenance,
+        auth: Option<&CodexAuth>,
     ) -> (Self, CancellationToken) {
         let cancel_token = CancellationToken::new();
         let mut clients = HashMap::new();
         let mut server_origins = HashMap::new();
         let mut join_set = JoinSet::new();
-        let elicitation_requests = ElicitationRequestManager::new(
-            approval_policy.value(),
-            initial_sandbox_state.sandbox_policy.clone(),
-        );
+        let elicitation_requests =
+            ElicitationRequestManager::new(approval_policy.value(), initial_sandbox_policy);
         let tool_plugin_provenance = Arc::new(tool_plugin_provenance);
         let startup_submit_id = submit_id.clone();
+        let codex_apps_auth_provider = auth
+            .filter(|auth| auth.uses_codex_backend())
+            .map(codex_model_provider::auth_provider_from_auth);
         let mcp_servers = mcp_servers.clone();
         for (server_name, cfg) in mcp_servers.into_iter().filter(|(_, cfg)| cfg.enabled) {
             if let Some(origin) = transport_origin(&cfg.transport) {
@@ -761,6 +788,19 @@ impl McpConnectionManager {
             } else {
                 None
             };
+            let uses_env_bearer_token = match &cfg.transport {
+                McpServerTransportConfig::StreamableHttp {
+                    bearer_token_env_var,
+                    ..
+                } => bearer_token_env_var.is_some(),
+                McpServerTransportConfig::Stdio { .. } => false,
+            };
+            let runtime_auth_provider =
+                if server_name == CODEX_APPS_MCP_SERVER_NAME && !uses_env_bearer_token {
+                    codex_apps_auth_provider.clone()
+                } else {
+                    None
+                };
             let async_managed_client = AsyncManagedClient::new(
                 server_name.clone(),
                 cfg,
@@ -770,30 +810,21 @@ impl McpConnectionManager {
                 elicitation_requests.clone(),
                 codex_apps_tools_cache_context,
                 Arc::clone(&tool_plugin_provenance),
+                runtime_environment.clone(),
+                runtime_auth_provider,
             );
             clients.insert(server_name.clone(), async_managed_client.clone());
             let tx_event = tx_event.clone();
             let submit_id = startup_submit_id.clone();
             let auth_entry = auth_entries.get(&server_name).cloned();
-            let sandbox_state = initial_sandbox_state.clone();
             join_set.spawn(async move {
-                let outcome = async_managed_client.client().await;
+                let mut outcome = async_managed_client.client().await;
                 if cancel_token.is_cancelled() {
-                    return (server_name, Err(StartupOutcomeError::Cancelled));
+                    outcome = Err(StartupOutcomeError::Cancelled);
                 }
                 let status = match &outcome {
-                    Ok(_) => {
-                        // Send sandbox state notification immediately after Ready
-                        if let Err(e) = async_managed_client
-                            .notify_sandbox_state_change(&sandbox_state)
-                            .await
-                        {
-                            warn!(
-                                "Failed to notify sandbox state to MCP server {server_name}: {e:#}",
-                            );
-                        }
-                        McpStartupStatus::Ready
-                    }
+                    Ok(_) => McpStartupStatus::Ready,
+                    Err(StartupOutcomeError::Cancelled) => McpStartupStatus::Cancelled,
                     Err(error) => {
                         let error_str = mcp_init_error_display(
                             server_name.as_str(),
@@ -1142,6 +1173,16 @@ impl McpConnectionManager {
         })
     }
 
+    pub async fn server_supports_sandbox_state_meta_capability(
+        &self,
+        server: &str,
+    ) -> Result<bool> {
+        Ok(self
+            .client_by_name(server)
+            .await?
+            .server_supports_sandbox_state_meta_capability)
+    }
+
     /// List resources from the specified server.
     pub async fn list_resources(
         &self,
@@ -1191,39 +1232,11 @@ impl McpConnectionManager {
             .with_context(|| format!("resources/read failed for `{server}` ({uri})"))
     }
 
-    pub async fn parse_tool_name(&self, tool_name: &str) -> Option<(String, String)> {
-        self.list_all_tools()
-            .await
-            .get(tool_name)
-            .map(|tool| (tool.server_name.clone(), tool.tool.name.to_string()))
-    }
-
-    pub async fn notify_sandbox_state_change(&self, sandbox_state: &SandboxState) -> Result<()> {
-        let mut join_set = JoinSet::new();
-
-        for async_managed_client in self.clients.values() {
-            let sandbox_state = sandbox_state.clone();
-            let async_managed_client = async_managed_client.clone();
-            join_set.spawn(async move {
-                async_managed_client
-                    .notify_sandbox_state_change(&sandbox_state)
-                    .await
-            });
-        }
-
-        while let Some(join_res) = join_set.join_next().await {
-            match join_res {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    warn!("Failed to notify sandbox state change to MCP server: {err:#}");
-                }
-                Err(err) => {
-                    warn!("Task panic when notifying sandbox state change to MCP server: {err:#}");
-                }
-            }
-        }
-
-        Ok(())
+    pub async fn resolve_tool_info(&self, tool_name: &ToolName) -> Option<ToolInfo> {
+        let all_tools = self.list_all_tools().await;
+        all_tools
+            .into_values()
+            .find(|tool| tool.canonical_tool_name() == *tool_name)
     }
 }
 
@@ -1470,11 +1483,11 @@ async fn start_server_task(
         .await
         .map_err(StartupOutcomeError::from)?;
 
-    let server_supports_sandbox_state_capability = initialize_result
+    let server_supports_sandbox_state_meta_capability = initialize_result
         .capabilities
         .experimental
         .as_ref()
-        .and_then(|exp| exp.get(MCP_SANDBOX_STATE_CAPABILITY))
+        .and_then(|exp| exp.get(MCP_SANDBOX_STATE_META_CAPABILITY))
         .is_some();
     let list_start = Instant::now();
     let fetch_start = Instant::now();
@@ -1511,7 +1524,7 @@ async fn start_server_task(
         tool_timeout: Some(tool_timeout),
         tool_filter,
         server_instructions: initialize_result.instructions,
-        server_supports_sandbox_state_capability,
+        server_supports_sandbox_state_meta_capability,
         codex_apps_tools_cache_context,
     };
 
@@ -1529,9 +1542,33 @@ struct StartServerTaskParams {
 
 async fn make_rmcp_client(
     server_name: &str,
-    transport: McpServerTransportConfig,
+    config: McpServerConfig,
     store_mode: OAuthCredentialsStoreMode,
+    runtime_environment: McpRuntimeEnvironment,
+    runtime_auth_provider: Option<SharedAuthProvider>,
 ) -> Result<RmcpClient, StartupOutcomeError> {
+    let McpServerConfig {
+        transport,
+        experimental_environment,
+        ..
+    } = config;
+    let remote_environment = match experimental_environment.as_deref() {
+        None | Some("local") => false,
+        Some("remote") => {
+            if !runtime_environment.environment().is_remote() {
+                return Err(StartupOutcomeError::from(anyhow!(
+                    "remote MCP server `{server_name}` requires a remote environment"
+                )));
+            }
+            true
+        }
+        Some(environment) => {
+            return Err(StartupOutcomeError::from(anyhow!(
+                "unsupported experimental_environment `{environment}` for MCP server `{server_name}`"
+            )));
+        }
+    };
+
     match transport {
         McpServerTransportConfig::Stdio {
             command,
@@ -1547,7 +1584,21 @@ async fn make_rmcp_client(
                     .map(|(key, value)| (key.into(), value.into()))
                     .collect::<HashMap<_, _>>()
             });
-            RmcpClient::new_stdio_client(command_os, args_os, env_os, &env_vars, cwd)
+            let launcher = if remote_environment {
+                Arc::new(ExecutorStdioServerLauncher::new(
+                    runtime_environment.environment().get_exec_backend(),
+                    runtime_environment.fallback_cwd(),
+                ))
+            } else {
+                Arc::new(LocalStdioServerLauncher::new(
+                    runtime_environment.fallback_cwd(),
+                )) as Arc<dyn StdioServerLauncher>
+            };
+
+            // `RmcpClient` always sees a launched MCP stdio server. The
+            // launcher hides whether that means a local child process or an
+            // executor process whose stdin/stdout bytes cross the process API.
+            RmcpClient::new_stdio_client(command_os, args_os, env_os, &env_vars, cwd, launcher)
                 .await
                 .map_err(|err| StartupOutcomeError::from(anyhow!(err)))
         }
@@ -1557,6 +1608,11 @@ async fn make_rmcp_client(
             env_http_headers,
             bearer_token_env_var,
         } => {
+            let http_client: Arc<dyn HttpClient> = if remote_environment {
+                runtime_environment.environment().get_http_client()
+            } else {
+                Arc::new(ReqwestHttpClient)
+            };
             let resolved_bearer_token =
                 match resolve_bearer_token(server_name, bearer_token_env_var.as_deref()) {
                     Ok(token) => token,
@@ -1569,6 +1625,8 @@ async fn make_rmcp_client(
                 http_headers,
                 env_http_headers,
                 store_mode,
+                http_client,
+                runtime_auth_provider,
             )
             .await
             .map_err(StartupOutcomeError::from)

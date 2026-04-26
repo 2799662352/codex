@@ -1,0 +1,46 @@
+# BuildKit 在使用 codex-source 作为 additional_contexts 时会读取此文件
+# 排除巨型/无关目录，避免 build context 上传卡顿（target/ 单独 3.6 GB）
+
+# Rust build artifacts
+codex-rs/target/
+codex-rs/**/target/
+target/
+**/target/
+
+# Git history（不需要进 build context）
+.git/
+.gitignore
+.gitattributes
+
+# Codex CLI npm/JS 部分（我们只编译 Rust 二进制，不需要 JS）
+codex-cli/node_modules/
+codex-cli/dist/
+codex-cli/build/
+**/node_modules/
+
+# 文档与 IDE
+docs/
+*.md
+!codex-rs/**/*.md
+.vscode/
+.idea/
+.DS_Store
+
+# 历史快照与备份
+sora-archive/
+*.tar
+*.tar.gz
+*.zip
+
+# CI 与编辑器辅助
+.github/
+.cursorrules
+.cursorignore
+
+# Python 缓存（如果有混入）
+__pycache__/
+*.pyc
+
+# 本地 dev 数据
+.codex/
+*.log

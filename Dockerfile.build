@@ -1,0 +1,28 @@
+FROM rust:1.93.0-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y \
+    pkg-config libssl-dev libcap-dev cmake g++ python3 curl git \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+ENV CARGO_PROFILE_RELEASE_LTO=false
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+ENV CARGO_PROFILE_RELEASE_OPT_LEVEL=2
+
+WORKDIR /build
+COPY codex-rs/ ./codex-rs/
+
+WORKDIR /build/codex-rs
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/codex-rs/target \
+    cargo build --release -p codex-cli --bin codex \
+    && cp target/release/codex /build/codex
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 git \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/codex /usr/local/bin/codex
+ENTRYPOINT ["codex"]
